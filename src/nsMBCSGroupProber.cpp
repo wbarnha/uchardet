@@ -51,6 +51,7 @@ const char *ProberName[] =
   "EUC-KR",
   "Big5",
   "EUC-TW",
+  "Johab"
 };
 
 #endif
@@ -58,7 +59,13 @@ const char *ProberName[] =
 nsMBCSGroupProber::nsMBCSGroupProber(PRUint32 aLanguageFilter)
 {
   for (PRUint32 i = 0; i < NUM_OF_PROBERS; i++)
-    mProbers[i] = nsnull;
+  {
+    mProbers[i]            = nsnull;
+    codePointBuffer[i]     = nsnull;
+    codePointBufferSize[i] = 0;
+    codePointBufferIdx[i]  = 0;
+    cjkDetectors[i]        = nsnull;
+  }
 
   mProbers[0] = new nsUTF8Prober();
   if (aLanguageFilter & NS_FILTER_JAPANESE) 
@@ -69,12 +76,20 @@ nsMBCSGroupProber::nsMBCSGroupProber(PRUint32 aLanguageFilter)
   if (aLanguageFilter & NS_FILTER_CHINESE_SIMPLIFIED)
     mProbers[3] = new nsGB18030Prober(aLanguageFilter == NS_FILTER_CHINESE_SIMPLIFIED);
   if (aLanguageFilter & NS_FILTER_KOREAN)
+  {
     mProbers[4] = new nsEUCKRProber(aLanguageFilter == NS_FILTER_KOREAN);
+    mProbers[7] = new nsJohabProber(aLanguageFilter == NS_FILTER_KOREAN);
+  }
   if (aLanguageFilter & NS_FILTER_CHINESE_TRADITIONAL) 
   {
     mProbers[5] = new nsBig5Prober(aLanguageFilter == NS_FILTER_CHINESE_TRADITIONAL);
     mProbers[6] = new nsEUCTWProber(aLanguageFilter == NS_FILTER_CHINESE_TRADITIONAL);
   }
+
+  for (PRUint32 i = 0; i < NUM_OF_PROBERS; i++)
+    if (mProbers[i] && mProbers[i]->DecodeToUnicode())
+      cjkDetectors[i] = new nsCJKDetector();
+
   Reset();
 }
 
@@ -83,21 +98,63 @@ nsMBCSGroupProber::~nsMBCSGroupProber()
   for (PRUint32 i = 0; i < NUM_OF_PROBERS; i++)
   {
     delete mProbers[i];
+
+    if (codePointBufferSize[i] != 0)
+      delete [] codePointBuffer[i];
+
+    delete cjkDetectors[i];
   }
 }
 
-const char* nsMBCSGroupProber::GetCharSetName()
+#define CANDIDATE_THRESHOLD 0.3f
+
+int nsMBCSGroupProber::GetCandidates()
 {
-  if (mBestGuess == -1)
-  {
-    GetConfidence();
-    if (mBestGuess == -1)
-      mBestGuess = 0;
-  }
-  return mProbers[mBestGuess]->GetCharSetName();
+  int num_candidates = 0;
+
+  CheckCandidates();
+
+  for (PRUint32 i = 0; i < NUM_OF_PROBERS; i++)
+    if (candidates[i])
+      num_candidates++;
+
+  return num_candidates;
 }
 
-void  nsMBCSGroupProber::Reset(void)
+const char* nsMBCSGroupProber::GetCharSetName(int candidate)
+{
+  int num_candidates = GetCandidates();
+  int candidate_it   = 0;
+
+  if (num_candidates == 0)
+    return NULL;
+  else if (candidate >= num_candidates)
+    /* Just show the first candidate. */
+    candidate = 0;
+
+  for (PRUint32 i = 0; i < NUM_OF_PROBERS; i++)
+    if (candidates[i])
+    {
+      if (candidate == candidate_it)
+      {
+        /* We assume that probers included in the nsMBCSGroupProber
+         * return only one candidate themselves.
+         * */
+        return mProbers[i]->GetCharSetName(0);
+      }
+      candidate_it++;
+    }
+
+  /* Should not happen. */
+  return NULL;
+}
+
+const char* nsMBCSGroupProber::GetLanguage(int candidate)
+{
+  return NULL;
+}
+
+void nsMBCSGroupProber::Reset(void)
 {
   mActiveNum = 0;
   for (PRUint32 i = 0; i < NUM_OF_PROBERS; i++)
@@ -107,16 +164,29 @@ void  nsMBCSGroupProber::Reset(void)
       mProbers[i]->Reset();
       mIsActive[i] = PR_TRUE;
       ++mActiveNum;
+
+      if (codePointBufferSize[i] == 0 && mProbers[i]->DecodeToUnicode())
+      {
+        codePointBufferSize[i] = 1024;
+        codePointBuffer[i] = new int[codePointBufferSize[i]];
+      }
+      codePointBufferIdx[i] = 0;
+
+      if (cjkDetectors[i])
+        cjkDetectors[i]->Reset();
     }
     else
       mIsActive[i] = PR_FALSE;
+
+    candidates[i] = false;
   }
-  mBestGuess = -1;
   mState = eDetecting;
   mKeepNext = 0;
 }
 
-nsProbingState nsMBCSGroupProber::HandleData(const char* aBuf, PRUint32 aLen)
+nsProbingState nsMBCSGroupProber::HandleData(const char* aBuf, PRUint32 aLen,
+                                             int** cpBuffer,
+                                             int*  cpBufferIdx)
 {
   nsProbingState st;
   PRUint32 start = 0;
@@ -137,14 +207,45 @@ nsProbingState nsMBCSGroupProber::HandleData(const char* aBuf, PRUint32 aLen)
       {
         for (PRUint32 i = 0; i < NUM_OF_PROBERS; i++)
         {
+          int sequenceLength;
+
           if (!mIsActive[i])
             continue;
-          st = mProbers[i]->HandleData(aBuf + start, pos + 1 - start);
+
+          sequenceLength = pos + 1 - start;
+
+          if (codePointBuffer[i])
+          {
+            PRUint32 sequenceStart = start;
+
+            while (sequenceLength > 0)
+            {
+              int subLength = (sequenceLength > codePointBufferSize[i]) ? codePointBufferSize[i] : sequenceLength;
+
+              st = mProbers[i]->HandleData(aBuf + sequenceStart, subLength,
+                                           &(codePointBuffer[i]), &(codePointBufferIdx[i]));
+              FlushCodePointBuffer(i);
+
+              sequenceStart += subLength;
+              sequenceLength -= subLength;
+            }
+          }
+          else
+          {
+            st = mProbers[i]->HandleData(aBuf + start, sequenceLength, NULL, NULL);
+          }
+
           if (st == eFoundIt)
           {
-            mBestGuess = i;
-            mState = eFoundIt;
-            return mState;
+            float cf = mProbers[i]->GetConfidence(0);
+            if (cjkDetectors[i] && cf < SHORTCUT_THRESHOLD)
+              cf *= cjkDetectors[i]->GetConfidence();
+
+            if (cf > CANDIDATE_THRESHOLD)
+            {
+              mState = eFoundIt;
+              return mState;
+            }
           }
         }
       }
@@ -156,12 +257,40 @@ nsProbingState nsMBCSGroupProber::HandleData(const char* aBuf, PRUint32 aLen)
     {
       if (!mIsActive[i])
         continue;
-      st = mProbers[i]->HandleData(aBuf + start, aLen - start);
+
+      if (codePointBuffer[i])
+      {
+        PRUint32 sequenceLength = aLen - start;
+        PRUint32 sequenceStart = start;
+
+        while (sequenceLength > 0)
+        {
+          int subLength = (sequenceLength > codePointBufferSize[i]) ? codePointBufferSize[i] : sequenceLength;
+
+          st = mProbers[i]->HandleData(aBuf + sequenceStart, subLength,
+                                       &(codePointBuffer[i]), &(codePointBufferIdx[i]));
+          FlushCodePointBuffer(i);
+
+          sequenceStart += subLength;
+          sequenceLength -= subLength;
+        }
+      }
+      else
+      {
+        st = mProbers[i]->HandleData(aBuf + start, aLen - start, NULL, NULL);
+      }
+
       if (st == eFoundIt)
       {
-        mBestGuess = i;
-        mState = eFoundIt;
-        return mState;
+        float cf = mProbers[i]->GetConfidence(0);
+        if (cjkDetectors[i] && cf < SHORTCUT_THRESHOLD)
+          cf *= cjkDetectors[i]->GetConfidence();
+
+        if (cf > CANDIDATE_THRESHOLD)
+        {
+          mState = eFoundIt;
+          return mState;
+        }
       }
     }
   }
@@ -170,31 +299,73 @@ nsProbingState nsMBCSGroupProber::HandleData(const char* aBuf, PRUint32 aLen)
   return mState;
 }
 
-float nsMBCSGroupProber::GetConfidence(void)
+void nsMBCSGroupProber::CheckCandidates()
 {
+  for (int i = 0; i < NUM_OF_PROBERS; i++)
+  {
+    if (! mIsActive[i])
+    {
+      candidates[i] = false;
+    }
+    else
+    {
+      float cf = mProbers[i]->GetConfidence(0);
+
+      FlushCodePointBuffer(i);
+      if (cjkDetectors[i] && cf < SHORTCUT_THRESHOLD)
+        cf *= cjkDetectors[i]->GetConfidence();
+
+      candidates[i] = (cf > CANDIDATE_THRESHOLD);
+    }
+  }
+}
+
+float nsMBCSGroupProber::GetConfidence(int candidate)
+{
+  int num_candidates = GetCandidates();
+  int candidate_it   = 0;
+
   PRUint32 i;
-  float bestConf = 0.0, cf;
+
+  if (num_candidates == 0)
+    return 0.0;
+  else if (candidate >= num_candidates)
+    /* Just show the first candidate. */
+    candidate = 0;
 
   switch (mState)
   {
-  case eFoundIt:
-    return (float)0.99;
   case eNotMe:
     return (float)0.01;
+  case eFoundIt:
   default:
     for (i = 0; i < NUM_OF_PROBERS; i++)
     {
-      if (!mIsActive[i])
-        continue;
-      cf = mProbers[i]->GetConfidence();
-      if (bestConf < cf)
+      if (candidates[i])
       {
-        bestConf = cf;
-        mBestGuess = i;
+        if (candidate == candidate_it)
+        {
+          float cf = mProbers[i]->GetConfidence(0);
+          if (cjkDetectors[i] && cf < SHORTCUT_THRESHOLD)
+            cf *= cjkDetectors[i]->GetConfidence();
+          return cf;
+        }
+        candidate_it++;
       }
     }
   }
-  return bestConf;
+
+  /* Should not happen. */
+  return 0.0;
+}
+
+void nsMBCSGroupProber::FlushCodePointBuffer(PRUint32 prober)
+{
+  if (cjkDetectors[prober] && codePointBuffer[prober] && codePointBufferIdx[prober] > 0)
+  {
+    cjkDetectors[prober]->HandleData(codePointBuffer[prober], codePointBufferIdx[prober]);
+    codePointBufferIdx[prober] = 0;
+  }
 }
 
 #ifdef DEBUG_chardet
@@ -203,14 +374,14 @@ void nsMBCSGroupProber::DumpStatus()
   PRUint32 i;
   float cf;
   
-  GetConfidence();
+  GetConfidence(0);
   for (i = 0; i < NUM_OF_PROBERS; i++)
   {
     if (!mIsActive[i])
       printf("  MBCS inactive: [%s] (confidence is too low).\r\n", ProberName[i]);
     else
     {
-      cf = mProbers[i]->GetConfidence();
+      cf = mProbers[i]->GetConfidence(0);
       printf("  MBCS %1.3f: [%s]\r\n", cf, ProberName[i]);
     }
   }
@@ -223,7 +394,7 @@ void nsMBCSGroupProber::GetDetectorState(nsUniversalDetector::DetectorState (&st
   for (PRUint32 i = 0; i < NUM_OF_PROBERS; ++i) {
     states[offset].name = ProberName[i];
     states[offset].isActive = mIsActive[i];
-    states[offset].confidence = mIsActive[i] ? mProbers[i]->GetConfidence() : 0.0;
+    states[offset].confidence = mIsActive[i] ? mProbers[i]->GetConfidence(0) : 0.0;
     ++offset;
   }
 }
